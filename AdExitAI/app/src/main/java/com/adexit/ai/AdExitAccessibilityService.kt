@@ -1,5 +1,4 @@
 
-
 package com.adexit.ai
 
 import android.accessibilityservice.AccessibilityService
@@ -16,9 +15,8 @@ import java.util.Locale
 class AdExitAccessibilityService : AccessibilityService() {
 
     private val handler = Handler(Looper.getMainLooper())
-
-    private var lastActionAt = 0L
     private var scanUntil = 0L
+    private var lastActionAt = 0L
     private var storeRecoveryInProgress = false
     private var storeBackAttempts = 0
 
@@ -31,18 +29,20 @@ class AdExitAccessibilityService : AccessibilityService() {
 
             if (root != null) {
                 try {
-                    if (isPlayStore(root)) {
+                    if (root.packageName?.toString() == PLAY_STORE_PACKAGE) {
                         recoverFromPlayStore()
                         return
                     }
 
-                    scanForCloseButtons(root)
+                    scanTree(root, root, 0)
                 } finally {
                     root.recycle()
                 }
             }
 
-            handler.postDelayed(this, SCAN_INTERVAL_MS)
+            if (automationEnabled() && System.currentTimeMillis() <= scanUntil) {
+                handler.postDelayed(this, SCAN_INTERVAL_MS)
+            }
         }
     }
 
@@ -90,98 +90,89 @@ class AdExitAccessibilityService : AccessibilityService() {
             .getBoolean(KEY_AUTOMATION_ENABLED, true)
     }
 
-    private fun isPlayStore(root: AccessibilityNodeInfo): Boolean {
-        return root.packageName?.toString() == PLAY_STORE_PACKAGE
-    }
-
-    private fun scanForCloseButtons(root: AccessibilityNodeInfo) {
-        if (System.currentTimeMillis() - lastActionAt < ACTION_COOLDOWN_MS) {
-            return
-        }
-
-        val candidates = ArrayList<AccessibilityNodeInfo>()
-
-        collectCandidates(root, root, candidates, 0)
-
-        for (node in candidates) {
-            try {
-                if (!node.isVisibleToUser || !node.isEnabled) continue
-
-                if (clickNodeOrClickableParent(node)) {
-                    lastActionAt = System.currentTimeMillis()
-                    scanUntil = lastActionAt + MAX_SCAN_WINDOW_MS
-                    return
-                }
-            } finally {
-                node.recycle()
-            }
-        }
-    }
-
-    private fun collectCandidates(
+    private fun scanTree(
         node: AccessibilityNodeInfo,
         root: AccessibilityNodeInfo,
-        output: MutableList<AccessibilityNodeInfo>,
         depth: Int
-    ) {
-        if (depth > 20 || output.size >= 50) return
+    ): Boolean {
+        if (depth > MAX_TREE_DEPTH) return false
 
-        val text = normalize(node.text?.toString())
-        val description = normalize(node.contentDescription?.toString())
-        val viewId = normalize(node.viewIdResourceName)
-
-        val combined = "$text $description $viewId"
-
-        val closeMatch =
-            text in CLOSE_LABELS ||
-            description in CLOSE_LABELS
-
-        val skipIconMatch =
-            text in SKIP_ICONS ||
-            description in SKIP_ICONS
-
-        val semanticMatch = CLOSE_TERMS.any {
-            combined.contains(it)
+        if (System.currentTimeMillis() - lastActionAt < ACTION_COOLDOWN_MS) {
+            return false
         }
 
-        val xMatch =
-            text in X_SYMBOLS ||
-            description in X_SYMBOLS
-
-        val clickable =
-            node.isClickable || hasClickableAncestor(node)
-
-        val shouldClick =
-            closeMatch ||
-            skipIconMatch ||
-            semanticMatch ||
-            (xMatch && isLikelyClosePosition(node, root))
-
-        if (clickable && node.isVisibleToUser && shouldClick) {
-            output.add(AccessibilityNodeInfo.obtain(node))
+        if (node.isVisibleToUser &&
+            node.isEnabled &&
+            isCloseOrSkipControl(node, root)
+        ) {
+            if (clickNodeOrClickableParent(node)) {
+                lastActionAt = System.currentTimeMillis()
+                return true
+            }
         }
 
-        // Recognize Google Play redirect text and chevron combinations.
-        // Do not click these links. Back is used after Play Store opens.
-        val googlePlayRedirect = GOOGLE_PLAY_TERMS.any {
-            combined.contains(it)
-        }
+        for (index in 0 until node.childCount) {
+            val child = node.getChild(index) ?: continue
 
-        if (googlePlayRedirect) {
-            // Recognition only. Play Store package events trigger Back.
-        }
-
-        for (i in 0 until node.childCount) {
-            val child = node.getChild(i) ?: continue
-
-            try {
-                collectCandidates(child, root, output, depth + 1)
+            val clicked = try {
+                scanTree(child, root, depth + 1)
             } finally {
                 child.recycle()
             }
 
-            if (output.size >= 50) return
+            if (clicked) return true
         }
+
+        return false
+    }
+
+    private fun isCloseOrSkipControl(
+        node: AccessibilityNodeInfo,
+        root: AccessibilityNodeInfo
+    ): Boolean {
+
+        val values = listOf(
+            normalize(node.text?.toString()),
+            normalize(node.contentDescription?.toString()),
+            normalize(node.viewIdResourceName)
+        ).filter { it.isNotEmpty() }
+
+        if (values.isEmpty()) return false
+
+        // Never click a Google Play redirect as if it were Close.
+        if (values.any { isGooglePlayLabel(it) }) return false
+
+        // Recognize Close and Skip, including buttons with chevrons.
+        val closeOrSkipLabel = values.any { value ->
+            value in CLOSE_LABELS ||
+                value.startsWith("skip") ||
+                value.startsWith("close") ||
+                value.startsWith("dismiss") ||
+                value.contains("skipbutton") ||
+                value.contains("closebutton") ||
+                value.contains("dismissbutton")
+        }
+
+        // Recognize the line-and-triangle Skip symbols.
+        val skipIcon = values.any { it in SKIP_ICONS }
+
+        // X is only treated as Close when it is near the upper-right corner.
+        val xIcon =
+            values.any { it in X_SYMBOLS } &&
+            isLikelyClosePosition(node, root)
+
+        // Standalone chevrons are not clicked.
+        // "Skip »" is still recognized as Skip.
+        return closeOrSkipLabel || skipIcon || xIcon
+    }
+
+    private fun isGooglePlayLabel(value: String): Boolean {
+        return value.contains("googleplay") ||
+            value.contains("getitongoogleplay") ||
+            value.contains("openwithgoogleplay") ||
+            value.contains("playstore") ||
+            value.contains("installnow") ||
+            value.contains("downloadnow")
     }
 
     private fun normalize(value: String?): String {
@@ -195,6 +186,7 @@ class AdExitAccessibilityService : AccessibilityService() {
         node: AccessibilityNodeInfo,
         root: AccessibilityNodeInfo
     ): Boolean {
+
         val nodeBounds = Rect()
         val rootBounds = Rect()
 
@@ -203,40 +195,20 @@ class AdExitAccessibilityService : AccessibilityService() {
 
         if (nodeBounds.isEmpty || rootBounds.isEmpty) return false
 
-        val topLimit = rootBounds.top + rootBounds.height() * 0.45f
-        val rightLimit = rootBounds.left + rootBounds.width() * 0.45f
+        val topLimit =
+            rootBounds.top + rootBounds.height() * 0.45f
+
+        val rightLimit =
+            rootBounds.left + rootBounds.width() * 0.45f
 
         return nodeBounds.centerY() <= topLimit &&
             nodeBounds.centerX() >= rightLimit
     }
 
-    private fun hasClickableAncestor(
-        node: AccessibilityNodeInfo
-    ): Boolean {
-        var parent = node.parent
-        var count = 0
-
-        while (parent != null && count < 5) {
-            val clickable = parent.isClickable
-            val next = parent.parent
-            parent.recycle()
-
-            if (clickable) {
-                next?.recycle()
-                return true
-            }
-
-            parent = next
-            count++
-        }
-
-        parent?.recycle()
-        return false
-    }
-
     private fun clickNodeOrClickableParent(
         node: AccessibilityNodeInfo
     ): Boolean {
+
         if (node.isClickable &&
             node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
         ) {
@@ -244,21 +216,27 @@ class AdExitAccessibilityService : AccessibilityService() {
         }
 
         var parent = node.parent
-        var count = 0
+        var depth = 0
 
-        while (parent != null && count < 5) {
-            if (parent.isClickable) {
-                val clicked = parent.performAction(
-                    AccessibilityNodeInfo.ACTION_CLICK
-                )
-                parent.recycle()
-                return clicked
+        while (parent != null && depth < MAX_PARENT_DEPTH) {
+
+            val isClickable = parent.isClickable
+
+            val didClick = isClickable &&
+                parent.isEnabled &&
+                parent.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+
+            val next = if (didClick) null else parent.parent
+
+            parent.recycle()
+
+            if (didClick) {
+                next?.recycle()
+                return true
             }
 
-            val next = parent.parent
-            parent.recycle()
             parent = next
-            count++
+            depth++
         }
 
         parent?.recycle()
@@ -272,7 +250,11 @@ class AdExitAccessibilityService : AccessibilityService() {
         storeBackAttempts = 0
 
         handler.removeCallbacks(scanRunnable)
-        performStoreBack()
+
+        // Let Google Play finish opening before pressing Back.
+        handler.postDelayed({
+            performStoreBack()
+        }, STORE_INITIAL_BACK_DELAY_MS)
     }
 
     private fun performStoreBack() {
@@ -286,26 +268,43 @@ class AdExitAccessibilityService : AccessibilityService() {
             return
         }
 
+        // Confirm Google Play is actually the foreground window.
+        val root = rootInActiveWindow
+
+        val stillInStore = try {
+            root?.packageName?.toString() == PLAY_STORE_PACKAGE
+        } finally {
+            root?.recycle()
+        }
+
+        // Do not press Back if the user is already back in the game.
+        if (!stillInStore) {
+            storeRecoveryInProgress = false
+            return
+        }
+
         storeBackAttempts++
 
         performGlobalAction(GLOBAL_ACTION_BACK)
 
         handler.postDelayed({
-            val root = rootInActiveWindow
 
-            val stillInStore = try {
-                root?.packageName?.toString() == PLAY_STORE_PACKAGE
+            val checkRoot = rootInActiveWindow
+
+            val remainsInStore = try {
+                checkRoot?.packageName?.toString() == PLAY_STORE_PACKAGE
             } finally {
-                root?.recycle()
+                checkRoot?.recycle()
             }
 
-            if (stillInStore &&
+            if (remainsInStore &&
                 storeBackAttempts < MAX_STORE_BACK_ATTEMPTS
             ) {
                 performStoreBack()
             } else {
                 storeRecoveryInProgress = false
             }
+
         }, STORE_BACK_INTERVAL_MS)
     }
 
@@ -320,6 +319,7 @@ class AdExitAccessibilityService : AccessibilityService() {
     }
 
     companion object {
+
         private const val PLAY_STORE_PACKAGE = "com.android.vending"
 
         private const val PREFS_NAME = "adexit_settings"
@@ -329,8 +329,12 @@ class AdExitAccessibilityService : AccessibilityService() {
         private const val MAX_SCAN_WINDOW_MS = 60_000L
         private const val ACTION_COOLDOWN_MS = 1_000L
 
+        private const val STORE_INITIAL_BACK_DELAY_MS = 350L
         private const val STORE_BACK_INTERVAL_MS = 700L
         private const val MAX_STORE_BACK_ATTEMPTS = 3
+
+        private const val MAX_TREE_DEPTH = 20
+        private const val MAX_PARENT_DEPTH = 5
 
         private val CLOSE_LABELS = setOf(
             "close",
@@ -358,34 +362,28 @@ class AdExitAccessibilityService : AccessibilityService() {
             "▶|",
             "|▸",
             "▸|",
+            "|►",
+            "►|",
+            "|▷",
+            "▷|",
             "|⏵",
             "⏵|",
             "|⏭",
-            "⏭|"
+            "⏭|",
+            "ı▶",
+            "▶ı"
         )
 
-        private val CLOSE_TERMS = listOf(
-            "close_ad",
-            "closead",
-            "skip_ad",
-            "skipad",
-            "dismiss_ad",
-            "dismissad",
-            "closebutton",
-            "skipbutton",
-            "dismissbutton"
-        )
-
-        private val GOOGLE_PLAY_TERMS = listOf(
-            "googleplay»",
-            "googleplay›",
-            "googleplay≫",
-            "googleplay❯",
-            "googleplay",
-            "getitongoogleplay",
-            "installnow",
-            "downloadnow",
-            "openingoog leplay".replace(" ", "")
+        private val CHEVRON_SYMBOLS = setOf(
+            "»",
+            "›",
+            "≫",
+            "❯",
+            "➜",
+            "→",
+            "⟶",
+            "⮞",
+            "⏩"
         )
 
         fun isEnabled(context: Context): Boolean {
@@ -403,22 +401,25 @@ class AdExitAccessibilityService : AccessibilityService() {
         }
 
         fun isAutomationEnabled(context: Context): Boolean {
-            return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-                .getBoolean(KEY_AUTOMATION_ENABLED, true)
+            return context.getSharedPreferences(
+                PREFS_NAME,
+                Context.MODE_PRIVATE
+            ).getBoolean(KEY_AUTOMATION_ENABLED, true)
         }
 
-        fun setAutomationEnabled(context: Context, enabled: Boolean) {
-            context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        fun setAutomationEnabled(
+            context: Context,
+            enabled: Boolean
+        ) {
+            context.getSharedPreferences(
+                PREFS_NAME,
+                Context.MODE_PRIVATE
+            )
                 .edit()
                 .putBoolean(KEY_AUTOMATION_ENABLED, enabled)
                 .apply()
         }
     }
 }
-
-}
-
-                .apply()
-        }
     }
 }
