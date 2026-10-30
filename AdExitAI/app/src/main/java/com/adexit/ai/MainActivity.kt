@@ -1,17 +1,15 @@
 
 package com.adexit.ai
 
-import android.accessibilityservice.AccessibilityService
+import android.app.Activity
 import android.content.Intent
 import android.os.Bundle
 import android.provider.Settings
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
-import android.widget.Toast
-import androidx.appcompat.app.AppCompatActivity
 
-class MainActivity : AppCompatActivity() {
+class MainActivity : Activity() {
 
     private lateinit var statusText: TextView
     private lateinit var automationButton: Button
@@ -37,7 +35,9 @@ class MainActivity : AppCompatActivity() {
         val accessibilityButton = Button(this).apply {
             text = "Open Accessibility Settings"
             setOnClickListener {
-                startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                startActivity(
+                    Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
+                )
             }
         }
 
@@ -95,3 +95,4 @@ class MainActivity : AppCompatActivity() {
             if (automationEnabled) "Pause Automation" else "Resume Automation"
     }
 }
+
