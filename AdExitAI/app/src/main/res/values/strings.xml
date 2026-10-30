@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">AdExit AI</string>
+    <string name="accessibility_description">Detects accessible ad close and skip controls and returns from Google Play redirects.</string>
+</resources>
