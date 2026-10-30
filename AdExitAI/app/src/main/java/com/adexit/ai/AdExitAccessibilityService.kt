@@ -4,98 +4,107 @@ package com.adexit.ai
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.AccessibilityServiceInfo
 import android.content.Context
-import android.os.Handler
-import android.os.Looper
+import android.graphics.Rect
 import android.provider.Settings
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import android.os.Handler
+import android.os.Looper
 import java.util.Locale
 
 class AdExitAccessibilityService : AccessibilityService() {
+
     private val handler = Handler(Looper.getMainLooper())
+
     private var lastActionAt = 0L
     private var scanUntil = 0L
-    private var storeBackAttempts = 0
     private var storeRecoveryInProgress = false
+    private var storeBackAttempts = 0
 
     private val scanRunnable = object : Runnable {
         override fun run() {
             if (!automationEnabled()) return
             if (System.currentTimeMillis() > scanUntil) return
-            val current = rootInActiveWindow
-            if (current != null) {
+
+            val root = rootInActiveWindow
+
+            if (root != null) {
                 try {
-                    if (current.packageName?.toString() == PLAY_STORE_PACKAGE) {
+                    if (isPlayStore(root)) {
                         recoverFromPlayStore()
                         return
                     }
-                    handleAdScreen(current)
+
+                    scanForCloseButtons(root)
                 } finally {
-                    current.recycle()
+                    root.recycle()
                 }
             }
+
             handler.postDelayed(this, SCAN_INTERVAL_MS)
         }
     }
 
     override fun onServiceConnected() {
         super.onServiceConnected()
+
         serviceInfo = serviceInfo.apply {
-            eventTypes = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED or
+            eventTypes =
+                AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED or
                 AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED or
                 AccessibilityEvent.TYPE_WINDOWS_CHANGED
+
             feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC
-            flags = flags or AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS or
+
+            flags = flags or
+                AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS or
                 AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
+
             notificationTimeout = 100
         }
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null || !automationEnabled()) return
+
         val pkg = event.packageName?.toString() ?: return
+
+        // If Google Play opens, return using Android Back.
         if (pkg == PLAY_STORE_PACKAGE) {
             recoverFromPlayStore()
             return
         }
+
         if (pkg == packageName || pkg == "com.android.systemui") return
 
         scanUntil = System.currentTimeMillis() + MAX_SCAN_WINDOW_MS
+
         handler.removeCallbacks(scanRunnable)
         handler.post(scanRunnable)
     }
 
-    private fun automationEnabled(): Boolean =
-        getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    private fun automationEnabled(): Boolean {
+        return getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .getBoolean(KEY_AUTOMATION_ENABLED, true)
+    }
 
-    private fun handleAdScreen(root: AccessibilityNodeInfo) {
-        val now = System.currentTimeMillis()
-        if (now - lastActionAt < ACTION_COOLDOWN_MS) return
+    private fun isPlayStore(root: AccessibilityNodeInfo): Boolean {
+        return root.packageName?.toString() == PLAY_STORE_PACKAGE
+    }
 
-        val signals = collectScreenSignals(root)
-        val hasGooglePlay = signals.any {
-            it.contains("google play") || it.contains("play store")
-        }
-        val hasAdMarker = signals.any { marker ->
-            AD_MARKERS.any { marker.contains(it) }
-        }
-        val hasChevron = signals.any { it.trim() in CHEVRON_MARKS }
-
-        if (hasGooglePlay && (hasAdMarker || hasChevron)) {
-            if (performGlobalAction(GLOBAL_ACTION_BACK)) {
-                lastActionAt = System.currentTimeMillis()
-                scanUntil = lastActionAt + MAX_SCAN_WINDOW_MS
-                return
-            }
+    private fun scanForCloseButtons(root: AccessibilityNodeInfo) {
+        if (System.currentTimeMillis() - lastActionAt < ACTION_COOLDOWN_MS) {
+            return
         }
 
-        if (!hasAdMarker && !hasGooglePlay) return
         val candidates = ArrayList<AccessibilityNodeInfo>()
-        collectCloseCandidates(root, candidates, 0)
+
+        collectCloseCandidates(root, root, candidates, 0)
+
         for (node in candidates) {
             try {
                 if (!node.isVisibleToUser || !node.isEnabled) continue
+
                 if (clickNodeOrClickableParent(node)) {
                     lastActionAt = System.currentTimeMillis()
                     scanUntil = lastActionAt + MAX_SCAN_WINDOW_MS
@@ -107,84 +116,120 @@ class AdExitAccessibilityService : AccessibilityService() {
         }
     }
 
-    private fun collectScreenSignals(root: AccessibilityNodeInfo): List<String> {
-        val values = ArrayList<String>()
-        collectSignalsRecursive(root, values, 0)
-        return values
-    }
-
-    private fun collectSignalsRecursive(
-        node: AccessibilityNodeInfo,
-        output: MutableList<String>,
-        depth: Int
-    ) {
-        if (depth > 18 || output.size >= 150) return
-        node.text?.toString()?.let {
-            output.add(it.lowercase(Locale.ROOT))
-        }
-        node.contentDescription?.toString()?.let {
-            output.add(it.lowercase(Locale.ROOT))
-        }
-        for (i in 0 until node.childCount) {
-            val child = node.getChild(i) ?: continue
-            try {
-                collectSignalsRecursive(child, output, depth + 1)
-            } finally {
-                child.recycle()
-            }
-            if (output.size >= 150) return
-        }
-    }
-
     private fun collectCloseCandidates(
         node: AccessibilityNodeInfo,
+        root: AccessibilityNodeInfo,
         output: MutableList<AccessibilityNodeInfo>,
         depth: Int
     ) {
-        if (depth > 18 || output.size >= 40) return
-        val text = node.text?.toString()?.trim()?.lowercase(Locale.ROOT).orEmpty()
-        val desc = node.contentDescription?.toString()?.trim()
-            ?.lowercase(Locale.ROOT).orEmpty()
-        val viewId = node.viewIdResourceName?.lowercase(Locale.ROOT).orEmpty()
-        val combined = "$text $desc $viewId"
+        if (depth > 20 || output.size >= 50) return
 
-        val exactClose = text in EXACT_CLOSE_LABELS ||
-            desc in EXACT_CLOSE_LABELS
-        val semanticClose = SEMANTIC_CLOSE_TERMS.any {
+        val text = normalize(node.text?.toString())
+        val description = normalize(node.contentDescription?.toString())
+        val viewId = normalize(node.viewIdResourceName)
+
+        val combined = "$text $description $viewId"
+
+        val closeMatch =
+            text in CLOSE_LABELS ||
+            description in CLOSE_LABELS
+
+        val skipIconMatch =
+            text in SKIP_ICONS ||
+            description in SKIP_ICONS
+
+        val semanticMatch = CLOSE_TERMS.any {
             combined.contains(it)
         }
 
-        if ((exactClose || semanticClose) &&
-            (node.isClickable || hasClickableAncestor(node))
-        ) {
-            output.add(AccessibilityNodeInfo.obtain(node))
+        val xMatch =
+            text in X_SYMBOLS ||
+            description in X_SYMBOLS
+
+        val isClickable =
+            node.isClickable || hasClickableAncestor(node)
+
+        if (isClickable && node.isVisibleToUser) {
+            val shouldClick =
+                closeMatch ||
+                skipIconMatch ||
+                semanticMatch ||
+                (xMatch && isLikelyClosePosition(node, root))
+
+            if (shouldClick) {
+                output.add(AccessibilityNodeInfo.obtain(node))
+            }
+        }
+
+        // Google Play and chevron recognition.
+        // Do not click standalone chevrons or store redirect labels.
+        val googlePlayRedirect = GOOGLE_PLAY_TERMS.any {
+            combined.contains(it)
+        }
+
+        if (googlePlayRedirect) {
+            // Recognized. Back recovery happens when Google Play opens.
         }
 
         for (i in 0 until node.childCount) {
             val child = node.getChild(i) ?: continue
+
             try {
-                collectCloseCandidates(child, output, depth + 1)
+                collectCloseCandidates(child, root, output, depth + 1)
             } finally {
                 child.recycle()
             }
-            if (output.size >= 40) return
+
+            if (output.size >= 50) return
         }
     }
 
-    private fun hasClickableAncestor(node: AccessibilityNodeInfo): Boolean {
+    private fun normalize(value: String?): String {
+        return value.orEmpty()
+            .trim()
+            .lowercase(Locale.ROOT)
+            .replace("\\s+".toRegex(), "")
+    }
+
+    private fun isLikelyClosePosition(
+        node: AccessibilityNodeInfo,
+        root: AccessibilityNodeInfo
+    ): Boolean {
+        val nodeRect = Rect()
+        val rootRect = Rect()
+
+        node.getBoundsInScreen(nodeRect)
+        root.getBoundsInScreen(rootRect)
+
+        if (nodeRect.isEmpty || rootRect.isEmpty) return false
+
+        val topLimit = rootRect.top + (rootRect.height() * 0.45f)
+        val rightLimit = rootRect.left + (rootRect.width() * 0.45f)
+
+        return nodeRect.centerY() <= topLimit &&
+            nodeRect.centerX() >= rightLimit
+    }
+
+    private fun hasClickableAncestor(
+        node: AccessibilityNodeInfo
+    ): Boolean {
         var parent = node.parent
         var hops = 0
+
         while (parent != null && hops < 5) {
             val clickable = parent.isClickable
             val next = parent.parent
             parent.recycle()
+
             if (clickable) {
                 next?.recycle()
                 return true
             }
+
             parent = next
             hops++
         }
+
         parent?.recycle()
         return false
     }
@@ -194,10 +239,13 @@ class AdExitAccessibilityService : AccessibilityService() {
     ): Boolean {
         if (node.isClickable &&
             node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-        ) return true
+        ) {
+            return true
+        }
 
         var parent = node.parent
         var hops = 0
+
         while (parent != null && hops < 5) {
             if (parent.isClickable) {
                 val clicked = parent.performAction(
@@ -206,37 +254,29 @@ class AdExitAccessibilityService : AccessibilityService() {
                 parent.recycle()
                 return clicked
             }
+
             val next = parent.parent
             parent.recycle()
             parent = next
             hops++
         }
+
         parent?.recycle()
         return false
     }
 
     private fun recoverFromPlayStore() {
         if (storeRecoveryInProgress || !automationEnabled()) return
+
         storeRecoveryInProgress = true
         storeBackAttempts = 0
+
         handler.removeCallbacks(scanRunnable)
-        pressBackWhileStoreRemains()
+        performStoreBack()
     }
 
-    private fun pressBackWhileStoreRemains() {
+    private fun performStoreBack() {
         if (!automationEnabled()) {
-            storeRecoveryInProgress = false
-            return
-        }
-
-        val activeRoot = rootInActiveWindow
-        val stillInStore = try {
-            activeRoot?.packageName?.toString() == PLAY_STORE_PACKAGE
-        } finally {
-            activeRoot?.recycle()
-        }
-
-        if (!stillInStore) {
             storeRecoveryInProgress = false
             return
         }
@@ -247,15 +287,31 @@ class AdExitAccessibilityService : AccessibilityService() {
         }
 
         storeBackAttempts++
+
         performGlobalAction(GLOBAL_ACTION_BACK)
-        handler.postDelayed(
-            { pressBackWhileStoreRemains() },
-            STORE_BACK_INTERVAL_MS
-        )
+
+        handler.postDelayed({
+            val root = rootInActiveWindow
+
+            val stillInStore = try {
+                root?.packageName?.toString() == PLAY_STORE_PACKAGE
+            } finally {
+                root?.recycle()
+            }
+
+            if (stillInStore &&
+                storeBackAttempts < MAX_STORE_BACK_ATTEMPTS
+            ) {
+                performStoreBack()
+            } else {
+                storeRecoveryInProgress = false
+            }
+
+        }, STORE_BACK_INTERVAL_MS)
     }
 
     override fun onInterrupt() {
-        handler.removeCallbacks(scanRunnable)
+        handler.removeCallbacksAndMessages(null)
         storeRecoveryInProgress = false
     }
 
@@ -266,36 +322,76 @@ class AdExitAccessibilityService : AccessibilityService() {
 
     companion object {
         private const val PLAY_STORE_PACKAGE = "com.android.vending"
+
         private const val PREFS_NAME = "adexit_settings"
         private const val KEY_AUTOMATION_ENABLED = "automation_enabled"
-        private const val SCAN_INTERVAL_MS = 650L
+
+        private const val SCAN_INTERVAL_MS = 500L
         private const val MAX_SCAN_WINDOW_MS = 60_000L
-        private const val ACTION_COOLDOWN_MS = 1_200L
+        private const val ACTION_COOLDOWN_MS = 1_000L
+
         private const val STORE_BACK_INTERVAL_MS = 700L
         private const val MAX_STORE_BACK_ATTEMPTS = 3
 
-        private val CHEVRON_MARKS = setOf(
-            "»", "›", "➜", "→", "⟶", "❯", "≫"
+        private val CLOSE_LABELS = setOf(
+            "x",
+            "×",
+            "✕",
+            "✖",
+            "✗",
+            "close",
+            "closead",
+            "skip",
+            "skipad",
+            "dismiss",
+            "dismissad",
+            "nothanks",
+            "notnow",
+            "continuetoapp",
+            "returntoapp"
         )
 
-        private val AD_MARKERS = listOf(
-            "sponsored",
-            "advertisement",
-            "ad choices",
-            "adchoice",
-            "advertiser",
-            "promoted"
+        private val X_SYMBOLS = setOf(
+            "x",
+            "×",
+            "✕",
+            "✖",
+            "✗"
         )
 
-        private val EXACT_CLOSE_LABELS = setOf(
-            "x", "×", "✕", "✖", "close", "close ad",
-            "skip", "skip ad", "dismiss", "dismiss ad",
-            "no thanks", "not now"
+        private val SKIP_ICONS = setOf(
+            "|▶",
+            "▶|",
+            "|▸",
+            "▸|",
+            "|⏵",
+            "⏵|",
+            "|⏭",
+            "⏭|"
         )
 
-        private val SEMANTIC_CLOSE_TERMS = listOf(
-            "close_ad", "closead", "skip_ad",
-            "skipad", "dismiss_ad", "dismissad"
+        private val CLOSE_TERMS = listOf(
+            "close_ad",
+            "closead",
+            "skip_ad",
+            "skipad",
+            "dismiss_ad",
+            "dismissad",
+            "closebutton",
+            "skipbutton",
+            "dismissbutton"
+        )
+
+        private val GOOGLE_PLAY_TERMS = listOf(
+            "googleplay»",
+            "googleplay›",
+            "googleplay≫",
+            "googleplay❯",
+            "googleplay",
+            "getitonGooglePlay".lowercase(Locale.ROOT),
+            "installnow",
+            "downloadnow",
+            "openinGooglePlay".lowercase(Locale.ROOT)
         )
 
         fun isEnabled(context: Context): Boolean {
@@ -312,14 +408,20 @@ class AdExitAccessibilityService : AccessibilityService() {
             }
         }
 
-        fun isAutomationEnabled(context: Context): Boolean =
-            context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        fun isAutomationEnabled(context: Context): Boolean {
+            return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
                 .getBoolean(KEY_AUTOMATION_ENABLED, true)
+        }
 
         fun setAutomationEnabled(context: Context, enabled: Boolean) {
             context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
                 .edit()
                 .putBoolean(KEY_AUTOMATION_ENABLED, enabled)
+                .apply()
+        }
+    }
+}
+
                 .apply()
         }
     }
