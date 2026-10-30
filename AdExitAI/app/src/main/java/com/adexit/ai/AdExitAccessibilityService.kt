@@ -1,4 +1,5 @@
 
+
 package com.adexit.ai
 
 import android.accessibilityservice.AccessibilityService
@@ -26,7 +27,6 @@ class AdExitAccessibilityService : AccessibilityService() {
             if (System.currentTimeMillis() > scanUntil) return
 
             val root = rootInActiveWindow
-
             if (root != null) {
                 try {
                     if (root.packageName?.toString() == PLAY_STORE_PACKAGE) {
@@ -130,7 +130,6 @@ class AdExitAccessibilityService : AccessibilityService() {
         node: AccessibilityNodeInfo,
         root: AccessibilityNodeInfo
     ): Boolean {
-
         val values = listOf(
             normalize(node.text?.toString()),
             normalize(node.contentDescription?.toString()),
@@ -139,10 +138,8 @@ class AdExitAccessibilityService : AccessibilityService() {
 
         if (values.isEmpty()) return false
 
-        // Never click a Google Play redirect as if it were Close.
         if (values.any { isGooglePlayLabel(it) }) return false
 
-        // Recognize Close and Skip, including buttons with chevrons.
         val closeOrSkipLabel = values.any { value ->
             value in CLOSE_LABELS ||
                 value.startsWith("skip") ||
@@ -153,16 +150,12 @@ class AdExitAccessibilityService : AccessibilityService() {
                 value.contains("dismissbutton")
         }
 
-        // Recognize the line-and-triangle Skip symbols.
         val skipIcon = values.any { it in SKIP_ICONS }
 
-        // X is only treated as Close when it is near the upper-right corner.
         val xIcon =
             values.any { it in X_SYMBOLS } &&
-            isLikelyClosePosition(node, root)
+                isLikelyClosePosition(node, root)
 
-        // Standalone chevrons are not clicked.
-        // "Skip »" is still recognized as Skip.
         return closeOrSkipLabel || skipIcon || xIcon
     }
 
@@ -186,7 +179,6 @@ class AdExitAccessibilityService : AccessibilityService() {
         node: AccessibilityNodeInfo,
         root: AccessibilityNodeInfo
     ): Boolean {
-
         val nodeBounds = Rect()
         val rootBounds = Rect()
 
@@ -208,7 +200,6 @@ class AdExitAccessibilityService : AccessibilityService() {
     private fun clickNodeOrClickableParent(
         node: AccessibilityNodeInfo
     ): Boolean {
-
         if (node.isClickable &&
             node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
         ) {
@@ -219,7 +210,6 @@ class AdExitAccessibilityService : AccessibilityService() {
         var depth = 0
 
         while (parent != null && depth < MAX_PARENT_DEPTH) {
-
             val isClickable = parent.isClickable
 
             val didClick = isClickable &&
@@ -251,7 +241,6 @@ class AdExitAccessibilityService : AccessibilityService() {
 
         handler.removeCallbacks(scanRunnable)
 
-        // Let Google Play finish opening before pressing Back.
         handler.postDelayed({
             performStoreBack()
         }, STORE_INITIAL_BACK_DELAY_MS)
@@ -268,7 +257,6 @@ class AdExitAccessibilityService : AccessibilityService() {
             return
         }
 
-        // Confirm Google Play is actually the foreground window.
         val root = rootInActiveWindow
 
         val stillInStore = try {
@@ -277,7 +265,6 @@ class AdExitAccessibilityService : AccessibilityService() {
             root?.recycle()
         }
 
-        // Do not press Back if the user is already back in the game.
         if (!stillInStore) {
             storeRecoveryInProgress = false
             return
@@ -421,5 +408,6 @@ class AdExitAccessibilityService : AccessibilityService() {
         }
     }
 }
+
     }
 }
