@@ -408,6 +408,5 @@ class AdExitAccessibilityService : AccessibilityService() {
         }
     }
 }
-
     }
 }
