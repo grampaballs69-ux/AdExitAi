@@ -1,15 +1,16 @@
 
+
 package com.adexit.ai
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.AccessibilityServiceInfo
 import android.content.Context
 import android.graphics.Rect
+import android.os.Handler
+import android.os.Looper
 import android.provider.Settings
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
-import android.os.Handler
-import android.os.Looper
 import java.util.Locale
 
 class AdExitAccessibilityService : AccessibilityService() {
@@ -67,15 +68,16 @@ class AdExitAccessibilityService : AccessibilityService() {
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null || !automationEnabled()) return
 
-        val pkg = event.packageName?.toString() ?: return
+        val eventPackage = event.packageName?.toString() ?: return
 
-        // If Google Play opens, return using Android Back.
-        if (pkg == PLAY_STORE_PACKAGE) {
+        if (eventPackage == PLAY_STORE_PACKAGE) {
             recoverFromPlayStore()
             return
         }
 
-        if (pkg == packageName || pkg == "com.android.systemui") return
+        if (eventPackage == packageName ||
+            eventPackage == "com.android.systemui"
+        ) return
 
         scanUntil = System.currentTimeMillis() + MAX_SCAN_WINDOW_MS
 
@@ -99,7 +101,7 @@ class AdExitAccessibilityService : AccessibilityService() {
 
         val candidates = ArrayList<AccessibilityNodeInfo>()
 
-        collectCloseCandidates(root, root, candidates, 0)
+        collectCandidates(root, root, candidates, 0)
 
         for (node in candidates) {
             try {
@@ -116,7 +118,7 @@ class AdExitAccessibilityService : AccessibilityService() {
         }
     }
 
-    private fun collectCloseCandidates(
+    private fun collectCandidates(
         node: AccessibilityNodeInfo,
         root: AccessibilityNodeInfo,
         output: MutableList<AccessibilityNodeInfo>,
@@ -146,36 +148,34 @@ class AdExitAccessibilityService : AccessibilityService() {
             text in X_SYMBOLS ||
             description in X_SYMBOLS
 
-        val isClickable =
+        val clickable =
             node.isClickable || hasClickableAncestor(node)
 
-        if (isClickable && node.isVisibleToUser) {
-            val shouldClick =
-                closeMatch ||
-                skipIconMatch ||
-                semanticMatch ||
-                (xMatch && isLikelyClosePosition(node, root))
+        val shouldClick =
+            closeMatch ||
+            skipIconMatch ||
+            semanticMatch ||
+            (xMatch && isLikelyClosePosition(node, root))
 
-            if (shouldClick) {
-                output.add(AccessibilityNodeInfo.obtain(node))
-            }
+        if (clickable && node.isVisibleToUser && shouldClick) {
+            output.add(AccessibilityNodeInfo.obtain(node))
         }
 
-        // Google Play and chevron recognition.
-        // Do not click standalone chevrons or store redirect labels.
+        // Recognize Google Play redirect text and chevron combinations.
+        // Do not click these links. Back is used after Play Store opens.
         val googlePlayRedirect = GOOGLE_PLAY_TERMS.any {
             combined.contains(it)
         }
 
         if (googlePlayRedirect) {
-            // Recognized. Back recovery happens when Google Play opens.
+            // Recognition only. Play Store package events trigger Back.
         }
 
         for (i in 0 until node.childCount) {
             val child = node.getChild(i) ?: continue
 
             try {
-                collectCloseCandidates(child, root, output, depth + 1)
+                collectCandidates(child, root, output, depth + 1)
             } finally {
                 child.recycle()
             }
@@ -195,28 +195,28 @@ class AdExitAccessibilityService : AccessibilityService() {
         node: AccessibilityNodeInfo,
         root: AccessibilityNodeInfo
     ): Boolean {
-        val nodeRect = Rect()
-        val rootRect = Rect()
+        val nodeBounds = Rect()
+        val rootBounds = Rect()
 
-        node.getBoundsInScreen(nodeRect)
-        root.getBoundsInScreen(rootRect)
+        node.getBoundsInScreen(nodeBounds)
+        root.getBoundsInScreen(rootBounds)
 
-        if (nodeRect.isEmpty || rootRect.isEmpty) return false
+        if (nodeBounds.isEmpty || rootBounds.isEmpty) return false
 
-        val topLimit = rootRect.top + (rootRect.height() * 0.45f)
-        val rightLimit = rootRect.left + (rootRect.width() * 0.45f)
+        val topLimit = rootBounds.top + rootBounds.height() * 0.45f
+        val rightLimit = rootBounds.left + rootBounds.width() * 0.45f
 
-        return nodeRect.centerY() <= topLimit &&
-            nodeRect.centerX() >= rightLimit
+        return nodeBounds.centerY() <= topLimit &&
+            nodeBounds.centerX() >= rightLimit
     }
 
     private fun hasClickableAncestor(
         node: AccessibilityNodeInfo
     ): Boolean {
         var parent = node.parent
-        var hops = 0
+        var count = 0
 
-        while (parent != null && hops < 5) {
+        while (parent != null && count < 5) {
             val clickable = parent.isClickable
             val next = parent.parent
             parent.recycle()
@@ -227,7 +227,7 @@ class AdExitAccessibilityService : AccessibilityService() {
             }
 
             parent = next
-            hops++
+            count++
         }
 
         parent?.recycle()
@@ -244,9 +244,9 @@ class AdExitAccessibilityService : AccessibilityService() {
         }
 
         var parent = node.parent
-        var hops = 0
+        var count = 0
 
-        while (parent != null && hops < 5) {
+        while (parent != null && count < 5) {
             if (parent.isClickable) {
                 val clicked = parent.performAction(
                     AccessibilityNodeInfo.ACTION_CLICK
@@ -258,7 +258,7 @@ class AdExitAccessibilityService : AccessibilityService() {
             val next = parent.parent
             parent.recycle()
             parent = next
-            hops++
+            count++
         }
 
         parent?.recycle()
@@ -306,7 +306,6 @@ class AdExitAccessibilityService : AccessibilityService() {
             } else {
                 storeRecoveryInProgress = false
             }
-
         }, STORE_BACK_INTERVAL_MS)
     }
 
@@ -334,11 +333,6 @@ class AdExitAccessibilityService : AccessibilityService() {
         private const val MAX_STORE_BACK_ATTEMPTS = 3
 
         private val CLOSE_LABELS = setOf(
-            "x",
-            "×",
-            "✕",
-            "✖",
-            "✗",
             "close",
             "closead",
             "skip",
@@ -388,10 +382,10 @@ class AdExitAccessibilityService : AccessibilityService() {
             "googleplay≫",
             "googleplay❯",
             "googleplay",
-            "getitonGooglePlay".lowercase(Locale.ROOT),
+            "getitongoogleplay",
             "installnow",
             "downloadnow",
-            "openinGooglePlay".lowercase(Locale.ROOT)
+            "openingoog leplay".replace(" ", "")
         )
 
         fun isEnabled(context: Context): Boolean {
@@ -420,6 +414,8 @@ class AdExitAccessibilityService : AccessibilityService() {
                 .apply()
         }
     }
+}
+
 }
 
                 .apply()
